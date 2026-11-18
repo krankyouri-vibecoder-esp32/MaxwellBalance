@@ -8,9 +8,9 @@ using System.Threading.Tasks;
 using System.Windows.Forms;
 using Microsoft.Win32.SafeHandles;
 [assembly: System.Reflection.AssemblyTitle("MaxwellBalance")]
-[assembly: System.Reflection.AssemblyVersion("0.1.0.0")]
-[assembly: System.Reflection.AssemblyFileVersion("0.1.0.0")]
-[assembly: System.Reflection.AssemblyInformationalVersion("0.1b")]
+[assembly: System.Reflection.AssemblyVersion("0.2.0.0")]
+[assembly: System.Reflection.AssemblyFileVersion("0.2.0.0")]
+[assembly: System.Reflection.AssemblyInformationalVersion("0.2b")]
 
 // Read-only RACE query, documented by junaydirfan/audezeforlinux:
 // https://github.com/junaydirfan/audezeforlinux/blob/master/docs/PROTOCOL.md
@@ -29,6 +29,7 @@ static class Hid {
     [DllImport("hid.dll")] static extern bool HidD_GetPreparsedData(SafeFileHandle h, out IntPtr p);
     [DllImport("hid.dll")] static extern bool HidD_FreePreparsedData(IntPtr p);
     [DllImport("hid.dll", SetLastError=true)] static extern bool HidD_GetInputReport(SafeFileHandle h, [In,Out] byte[] b, int length);
+    [DllImport("hid.dll", SetLastError=true)] static extern bool HidD_SetOutputReport(SafeFileHandle h, byte[] b, int length);
     [DllImport("hid.dll")] static extern int HidP_GetCaps(IntPtr p, out Caps c);
     [DllImport("setupapi.dll", CharSet=CharSet.Unicode, SetLastError=true)] static extern IntPtr SetupDiGetClassDevs(ref Guid g, string e, IntPtr w, uint flags);
     [DllImport("setupapi.dll", SetLastError=true)] static extern bool SetupDiEnumDeviceInterfaces(IntPtr s, IntPtr d, ref Guid g, uint i, ref Interface data);
@@ -46,6 +47,31 @@ static class Hid {
         internal int input, output;
         internal byte route;
         public void Dispose() { handle.Dispose(); }
+        internal void Diagnose(List<string> log) {
+            foreach(byte target in new byte[]{route,0}) {
+                foreach(byte[] command in new byte[][] {
+                    new byte[]{5,0x5A,4,0,0x83,0x2C,0x0B,0},
+                    new byte[]{5,0x5A,3,0,7,0x1C,0}}) {
+                    log.Add("Route="+target.ToString("X2")+" command="+BitConverter.ToString(command));
+                    byte[] request=new byte[output]; request[0]=6; request[1]=(byte)command.Length; request[2]=target;
+                    Array.Copy(command,0,request,3,command.Length);
+                    if(!HidD_SetOutputReport(handle,request,request.Length)) {log.Add("Control write failed="+Marshal.GetLastWin32Error());continue;}
+                    var until=DateTime.UtcNow.AddSeconds(2); int empty=0;
+                    while(DateTime.UtcNow<until) {
+                        byte[] reply=new byte[input]; reply[0]=7;
+                        bool ok=HidD_GetInputReport(handle,reply,reply.Length);
+                        if(ok && reply[1]>0) log.Add("CONTROL "+BitConverter.ToString(reply));
+                        else empty++;
+                        try {
+                            byte[] interrupt=new byte[input]; int n=Transfer(handle,interrupt,false,30);
+                            log.Add("INTERRUPT "+BitConverter.ToString(interrupt,0,n));
+                        } catch(IOException) {}
+                        Thread.Sleep(20);
+                    }
+                    log.Add("Empty control reads="+empty);
+                }
+            }
+        }
         internal int Query() {
             for(int i=0;i<8;i++) {
                 byte[] old=new byte[input]; old[0]=7;
@@ -55,23 +81,20 @@ static class Hid {
             byte[] frame = {6,8,route,5,0x5A,4,0,0x83,0x2C,0x0B,0};
             Array.Copy(frame, request, frame.Length);
             Transfer(handle,request,true,600);
-            DateTime until=DateTime.UtcNow.AddMilliseconds(650);
+            var decoder=new BalanceDecoder();
+            DateTime until=DateTime.UtcNow.AddMilliseconds(1500);
             while(DateTime.UtcNow<until) {
+                Thread.Sleep(50);
                 byte[] reply=new byte[input]; reply[0]=7;
                 bool ok=HidD_GetInputReport(handle,reply,reply.Length);
-                int value=ok?Parse(reply,reply.Length):-1;
+                int value=ok?decoder.Feed(reply,reply.Length):-1;
                 if(value>=0) return value;
-                Thread.Sleep(20);
             }
             throw new IOException("Geen geldig balansantwoord ontvangen");
         }
     }
     internal static int Parse(byte[] b, int n) {
-        // Exact short response: report 07, RACE 05 5B 06 00 83 2C 00 0B 00 value.
-        if(n<13 || b[0]!=7 || b[1]!=10 || b[3]!=5 || b[4]!=0x5B ||
-           b[5]!=6 || b[6]!=0 || b[7]!=0x83 || b[8]!=0x2C ||
-           b[9]!=0 || b[10]!=0x0B || b[11]!=0 || b[12]>20) return -1;
-        return b[12];
+        return new BalanceDecoder().Feed(b,n);
     }
     static int Transfer(SafeFileHandle h, byte[] bytes, bool write, int timeout) {
         using(var ev=new EventWaitHandle(false,EventResetMode.ManualReset)) {
@@ -129,6 +152,26 @@ static class Hid {
     }
 }
 
+// A dongle may combine several RACE replies or split one across HID reports.
+sealed class BalanceDecoder {
+    readonly List<byte> stream=new List<byte>();
+    internal int Feed(byte[] b,int n) {
+        if(b==null || n<3 || n>b.Length || b[0]!=7 || b[1]>59 || b[1]+3>n) {stream.Clear();return -1;}
+        for(int i=0;i<b[1];i++) stream.Add(b[i+3]);
+        int found=-1;
+        while(stream.Count>=4) {
+            if(stream[0]!=5) {stream.RemoveAt(0);continue;}
+            int length=4+stream[2]+256*stream[3];
+            if(length<6 || length>1024) {stream.RemoveAt(0);continue;}
+            if(stream.Count<length) break;
+            if(length==10 && stream[1]==0x5B && stream[4]==0x83 && stream[5]==0x2C &&
+                stream[6]==0 && stream[7]==0x0B && stream[8]==0 && stream[9]<=20) found=stream[9];
+            stream.RemoveRange(0,length);
+        }
+        return found;
+    }
+}
+
 // Connection/status changes must never masquerade as wheel movement.
 sealed class BalanceChanges {
     int last=-1, candidate=-1, repeats;
@@ -157,7 +200,7 @@ sealed class BalanceWindow : Form {
     protected override bool ShowWithoutActivation { get { return true; } }
     protected override CreateParams CreateParams { get { var p=base.CreateParams; p.ExStyle|=0x08000000|0x80; return p; } }
     public BalanceWindow() {
-        Text="MaxwellBalance 0.1b · Game / Chat"; ClientSize=new Size(410,135);
+        Text="MaxwellBalance 0.2b · Game / Chat"; ClientSize=new Size(410,135);
         FormBorderStyle=FormBorderStyle.None; ShowInTaskbar=false; TopMost=true;
         BackColor=Color.FromArgb(22,25,34); ForeColor=Color.White;
         Font=new Font("Segoe UI",10); DoubleBuffered=true;
@@ -241,7 +284,22 @@ sealed class BalanceWindow : Form {
 
 static class Program {
     [STAThread] static void Main(string[] args) {
+        if(args.Length>0 && args[0]=="--diagnose") {
+            var log=new List<string>(); var devices=Hid.Find();
+            log.Add("Devices="+devices.Count);
+            foreach(var device in devices) using(device) {
+                log.Add("PID="+device.product.ToString("X4")); device.Diagnose(log);
+            }
+            File.WriteAllLines(Path.Combine(AppDomain.CurrentDomain.BaseDirectory,"wireless-diagnostic.txt"),log);return;
+        }
         if(args.Length>0 && args[0]=="--test") {
+            var decoder=new BalanceDecoder();
+            if(decoder.Feed(new byte[]{7,5,128,5,0x5B,6,0,0x83},8)!=-1 ||
+               decoder.Feed(new byte[]{7,0,128},3)!=-1 ||
+               decoder.Feed(new byte[]{7,5,128,0x2C,0,0x0B,0,15},8)!=15)
+                throw new Exception("Fragmented wireless reply failed");
+            byte[] combined={7,17,128,5,0x5B,3,0,0xD6,0x0C,0,5,0x5B,6,0,0x83,0x2C,0,0x0B,0,8};
+            if(new BalanceDecoder().Feed(combined,combined.Length)!=8) throw new Exception("Combined replies failed");
             var changes=new BalanceChanges();
             foreach(int v in new[]{10,10,-1,10,10,11,10,10})
                 if(changes.Accept(v)) throw new Exception("Spurious startup/reconnect/transient popup");
@@ -255,7 +313,7 @@ static class Program {
             reply[12]=10; reply[9]=1; if(Hid.Parse(reply,13)!=-1) throw new Exception("Error response accepted");
             reply[9]=0; if(Hid.Parse(reply,12)!=-1) throw new Exception("Truncated response accepted");
             reply[10]=7; if(Hid.Parse(reply,13)!=-1) throw new Exception("Wrong subcommand accepted");
-            File.WriteAllText(Path.Combine(AppDomain.CurrentDomain.BaseDirectory,"test-result.txt"),"PASS: response validation; silent startup, reconnect and transient readings; confirmed movement notifies once.");
+            File.WriteAllText(Path.Combine(AppDomain.CurrentDomain.BaseDirectory,"test-result.txt"),"PASS: response validation, fragmented and combined wireless replies; silent startup/reconnect/transients; confirmed movement notifies once.");
             return;
         }
         if(args.Length>0 && args[0]=="--probe") {
@@ -276,3 +334,4 @@ static class Program {
         }
     }
 }
+
